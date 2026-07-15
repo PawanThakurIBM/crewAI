@@ -30,9 +30,155 @@ def test_openai_completion_is_used_when_no_provider_prefix():
     llm = LLM(model="gpt-4o")
 
     from crewai.llms.providers.openai.completion import OpenAICompletion
-    assert isinstance(llm, OpenAICompletion)
+    assert llm.__class__.__name__ == "OpenAICompletion"
     assert llm.provider == "openai"
     assert llm.model == "gpt-4o"
+
+
+def test_custom_openai_flag_uses_native_openai_without_provider_prefix():
+    """Custom OpenAI-compatible endpoints can serve arbitrary model ids."""
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=False):
+        llm = LLM(
+            model="anthropic/claude-sonnet-4-6",
+            custom_openai=True,
+            base_url="https://gateway.example/v1",
+            is_litellm=False,
+        )
+
+    assert llm.__class__.__name__ == "OpenAICompletion"
+    assert llm.is_litellm is False
+    assert llm.provider == "openai"
+    assert llm.model == "anthropic/claude-sonnet-4-6"
+    assert llm.base_url == "https://gateway.example/v1"
+    assert llm.custom_openai is True
+    assert "custom_openai" not in llm.additional_params
+
+    config = llm.to_config_dict()
+    assert config["model"] == "anthropic/claude-sonnet-4-6"
+    assert config["custom_openai"] is True
+    assert config["base_url"] == "https://gateway.example/v1"
+
+    rebuilt = LLM(**config)
+    assert isinstance(rebuilt, OpenAICompletion)
+    assert rebuilt.model == "anthropic/claude-sonnet-4-6"
+    assert rebuilt.base_url == "https://gateway.example/v1"
+
+
+def test_custom_openai_flag_requires_custom_base_url():
+    """Avoid routing arbitrary custom model ids to api.openai.com by mistake."""
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+        with pytest.raises(ValueError, match="custom_openai=True requires"):
+            LLM(
+                model="anthropic/claude-sonnet-4-6",
+                custom_openai=True,
+                is_litellm=False,
+            )
+
+
+def test_direct_custom_openai_completion_requires_custom_base_url():
+    """Direct construction must not silently fall back to api.openai.com."""
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):
+        with pytest.raises(ValueError, match="custom_openai=True requires"):
+            OpenAICompletion(
+                model="anthropic/claude-sonnet-4-6",
+                custom_openai=True,
+            )
+
+
+def test_custom_openai_flag_strips_openai_routing_prefix():
+    """The openai/ routing prefix is not part of the gateway's model id."""
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=False):
+        llm = LLM(
+            model="openai/anthropic/claude-sonnet-4-6",
+            custom_openai=True,
+            base_url="https://gateway.example/v1",
+            is_litellm=False,
+        )
+
+    assert isinstance(llm, OpenAICompletion)
+    assert llm.model == "anthropic/claude-sonnet-4-6"
+
+
+def test_openai_prefixed_custom_endpoint_uses_native_sdk_for_nested_model_id():
+    """Custom OpenAI-compatible endpoints may serve non-OpenAI model ids."""
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=False):
+        llm = LLM(
+            model="openai/anthropic/claude-sonnet-4-6",
+            base_url="https://gateway.example/v1",
+            is_litellm=False,
+        )
+
+    assert llm.__class__.__name__ == "OpenAICompletion"
+    assert llm.is_litellm is False
+    assert llm.provider == "openai"
+    assert llm.model == "anthropic/claude-sonnet-4-6"
+    assert llm.custom_openai is True
+    assert llm.base_url == "https://gateway.example/v1"
+
+def test_explicit_custom_openai_uses_legacy_api_base_env_var():
+    """Explicit custom routing supports the legacy endpoint environment variable."""
+    with patch.dict(
+        os.environ,
+        {
+            "OPENAI_API_KEY": "test-key",
+            "OPENAI_API_BASE": "https://gateway.example/v1",
+        },
+        clear=False,
+    ):
+        os.environ.pop("OPENAI_BASE_URL", None)
+        llm = LLM(
+            model="openai/anthropic/claude-sonnet-4-6",
+            custom_openai=True,
+            is_litellm=False,
+        )
+
+    assert isinstance(llm, OpenAICompletion)
+    assert llm.is_litellm is False
+    assert llm.provider == "openai"
+    assert llm.model == "anthropic/claude-sonnet-4-6"
+    assert llm.custom_openai is True
+
+
+def test_openai_prefixed_unknown_model_ignores_ambient_base_url_for_routing():
+    """Ambient OpenAI configuration must not opt unknown models into native routing."""
+    with patch.dict(
+        os.environ,
+        {
+            "OPENAI_API_KEY": "test-key",
+            "OPENAI_BASE_URL": "https://gateway.example/v1",
+        },
+        clear=True,
+    ):
+        with (
+            patch("crewai.llm._ensure_litellm", return_value=False),
+            pytest.raises(ImportError, match="LiteLLM fallback package"),
+        ):
+            LLM(model="openai/not-a-real-openai-model")
+
+
+@pytest.mark.parametrize("endpoint_field", ["api_base", "env"])
+def test_custom_openai_config_preserves_resolved_endpoint(endpoint_field):
+    """Serialized custom OpenAI configs can reconstruct the same endpoint."""
+    kwargs = {}
+    env = {"OPENAI_API_KEY": "test-key"}
+    if endpoint_field == "api_base":
+        kwargs["api_base"] = "https://gateway.example/v1"
+    else:
+        env["OPENAI_API_BASE"] = "https://gateway.example/v1"
+
+    with patch.dict(os.environ, env, clear=True):
+        llm = LLM(
+            model="anthropic/claude-sonnet-4-6",
+            custom_openai=True,
+            **kwargs,
+        )
+
+    config = llm.to_config_dict()
+    assert config["base_url"] == "https://gateway.example/v1"
+    rebuilt = LLM(**config)
+    assert isinstance(rebuilt, OpenAICompletion)
+    assert rebuilt.base_url == "https://gateway.example/v1"
+
 
 @pytest.mark.vcr()
 def test_openai_is_default_provider_without_explicit_llm_set_on_agent():
@@ -60,25 +206,20 @@ def test_openai_is_default_provider_without_explicit_llm_set_on_agent():
 
 
 
-def test_openai_completion_module_is_imported():
+def test_openai_completion_module_is_imported(monkeypatch):
     """
     Test that the completion module is properly imported when using OpenAI provider
     """
     module_name = "crewai.llms.providers.openai.completion"
 
-    # Remove module from cache if it exists
-    if module_name in sys.modules:
-        del sys.modules[module_name]
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
 
-    # Create LLM instance - this should trigger the import
     LLM(model="gpt-4o")
 
-    # Verify the module was imported
     assert module_name in sys.modules
     completion_mod = sys.modules[module_name]
     assert isinstance(completion_mod, types.ModuleType)
 
-    # Verify the class exists in the module
     assert hasattr(completion_mod, 'OpenAICompletion')
 
 
@@ -87,7 +228,6 @@ def test_native_openai_raises_error_when_initialization_fails():
     Test that LLM raises ImportError when native OpenAI completion fails to initialize.
     This ensures we don't silently fall back when there's a configuration issue.
     """
-    # Mock the _get_native_provider to return a failing class
     with patch('crewai.llm.LLM._get_native_provider') as mock_get_provider:
 
         class FailingCompletion:
@@ -127,7 +267,6 @@ def test_openai_completion_call():
     """
     llm = LLM(model="openai/gpt-4o")
 
-    # Mock the call method on the instance
     with patch.object(llm, 'call', return_value="Hello! I'm ready to help.") as mock_call:
         result = llm.call("Hello, how are you?")
 
@@ -139,13 +278,10 @@ def test_openai_completion_called_during_crew_execution():
     """
     Test that OpenAICompletion.call is actually invoked when running a crew
     """
-    # Create the LLM instance first
     openai_llm = LLM(model="openai/gpt-4o")
 
-    # Mock the call method on the specific instance
     with patch.object(openai_llm, 'call', return_value="Tokyo has 14 million people.") as mock_call:
 
-        # Create agent with explicit LLM configuration
         agent = Agent(
             role="Research Assistant",
             goal="Find population info",
@@ -162,7 +298,6 @@ def test_openai_completion_called_during_crew_execution():
         crew = Crew(agents=[agent], tasks=[task])
         result = crew.kickoff()
 
-        # Verify mock was called
         assert mock_call.called
         assert "14 million" in str(result)
 
@@ -171,10 +306,8 @@ def test_openai_completion_call_arguments():
     """
     Test that OpenAICompletion.call is invoked with correct arguments
     """
-    # Create LLM instance first (like working tests)
     openai_llm = LLM(model="openai/gpt-4o")
 
-    # Mock the instance method (like working tests)
     with patch.object(openai_llm, 'call') as mock_call:
         mock_call.return_value = "Task completed successfully."
 
@@ -182,7 +315,7 @@ def test_openai_completion_call_arguments():
             role="Test Agent",
             goal="Complete a simple task",
             backstory="You are a test agent.",
-            llm=openai_llm  # Use same instance
+            llm=openai_llm
         )
 
         task = Task(
@@ -194,18 +327,14 @@ def test_openai_completion_call_arguments():
         crew = Crew(agents=[agent], tasks=[task])
         crew.kickoff()
 
-        # Verify call was made
         assert mock_call.called
 
-        # Check the arguments passed to the call method
         call_args = mock_call.call_args
         assert call_args is not None
 
-        # The first argument should be the messages
-        messages = call_args[0][0]  # First positional argument
+        messages = call_args[0][0]
         assert isinstance(messages, (str, list))
 
-        # Verify that the task description appears in the messages
         if isinstance(messages, str):
             assert "hello world" in messages.lower()
         elif isinstance(messages, list):
@@ -217,10 +346,8 @@ def test_multiple_openai_calls_in_crew():
     """
     Test that OpenAICompletion.call is invoked multiple times for multiple tasks
     """
-    # Create LLM instance first
     openai_llm = LLM(model="openai/gpt-4o")
 
-    # Mock the instance method
     with patch.object(openai_llm, 'call') as mock_call:
         mock_call.return_value = "Task completed."
 
@@ -228,7 +355,7 @@ def test_multiple_openai_calls_in_crew():
             role="Multi-task Agent",
             goal="Complete multiple tasks",
             backstory="You can handle multiple tasks.",
-            llm=openai_llm  # Use same instance
+            llm=openai_llm
         )
 
         task1 = Task(
@@ -249,12 +376,10 @@ def test_multiple_openai_calls_in_crew():
         )
         crew.kickoff()
 
-        # Verify multiple calls were made
         assert mock_call.call_count >= 2  # At least one call per task
 
-        # Verify each call had proper arguments
         for call in mock_call.call_args_list:
-            assert len(call[0]) > 0  # Has positional arguments
+            assert len(call[0]) > 0
             messages = call[0][0]
             assert messages is not None
 
@@ -270,10 +395,8 @@ def test_openai_completion_with_tools():
         """A sample tool for testing"""
         return f"Tool result for: {query}"
 
-    # Create LLM instance first
     openai_llm = LLM(model="openai/gpt-4o")
 
-    # Mock the instance method (not the class method)
     with patch.object(openai_llm, 'call') as mock_call:
         mock_call.return_value = "Task completed with tools."
 
@@ -281,7 +404,7 @@ def test_openai_completion_with_tools():
             role="Tool User",
             goal="Use tools to complete tasks",
             backstory="You can use tools.",
-            llm=openai_llm,  # Use same instance
+            llm=openai_llm,
             tools=[sample_tool]
         )
 
@@ -364,16 +487,13 @@ def test_openai_client_setup_with_extra_arguments():
         timeout=30
     )
 
-    # Check that model parameters are stored on the LLM instance
     assert llm.temperature == 0.7
     assert llm.max_tokens == 1000
     assert llm.top_p == 0.5
 
-    # Check that client parameters are properly configured
     assert llm._client.max_retries == 3
     assert llm._client.timeout == 30
 
-    # Test that parameters are properly used in API calls
     with patch.object(llm._client.chat.completions, 'create') as mock_create:
         mock_create.return_value = MagicMock(
             choices=[MagicMock(message=MagicMock(content="test response", tool_calls=None))],
@@ -382,8 +502,7 @@ def test_openai_client_setup_with_extra_arguments():
 
         llm.call("Hello")
 
-        # Verify the API was called with the right parameters
-        call_args = mock_create.call_args[1]  # keyword arguments
+        call_args = mock_create.call_args[1]
         assert call_args['temperature'] == 0.7
         assert call_args['max_tokens'] == 1000
         assert call_args['top_p'] == 0.5
@@ -447,14 +566,26 @@ def test_openai_get_client_params_with_env_var():
         client_params = llm._get_client_params()
         assert client_params["base_url"] == "https://env.openai.com/v1"
 
+def test_openai_get_client_params_with_legacy_api_base_env_var():
+    """
+    Test that _get_client_params uses OPENAI_API_BASE when OPENAI_BASE_URL is absent.
+    """
+    with patch.dict(os.environ, {
+        "OPENAI_API_BASE": "https://legacy-env.openai.com/v1",
+    }, clear=False):
+        os.environ.pop("OPENAI_BASE_URL", None)
+        llm = OpenAICompletion(model="gpt-4o")
+        client_params = llm._get_client_params()
+        assert client_params["base_url"] == "https://legacy-env.openai.com/v1"
+
 def test_openai_get_client_params_priority_order():
     """
-    Test the priority order: base_url > api_base > OPENAI_BASE_URL env var
+    Test the priority order: base_url > api_base > OPENAI_BASE_URL > OPENAI_API_BASE
     """
     with patch.dict(os.environ, {
         "OPENAI_BASE_URL": "https://env.openai.com/v1",
+        "OPENAI_API_BASE": "https://legacy-env.openai.com/v1",
     }):
-        # Test base_url beats api_base and env var
         llm1 = OpenAICompletion(
             model="gpt-4o",
             base_url="https://base-url.openai.com/v1",
@@ -463,7 +594,6 @@ def test_openai_get_client_params_priority_order():
         params1 = llm1._get_client_params()
         assert params1["base_url"] == "https://base-url.openai.com/v1"
 
-        # Test api_base beats env var when base_url is None
         llm2 = OpenAICompletion(
             model="gpt-4o",
             api_base="https://api-base.openai.com/v1",
@@ -471,7 +601,6 @@ def test_openai_get_client_params_priority_order():
         params2 = llm2._get_client_params()
         assert params2["base_url"] == "https://api-base.openai.com/v1"
 
-        # Test env var is used when both base_url and api_base are None
         llm3 = OpenAICompletion(model="gpt-4o")
         params3 = llm3._get_client_params()
         assert params3["base_url"] == "https://env.openai.com/v1"
@@ -480,7 +609,6 @@ def test_openai_get_client_params_no_base_url(monkeypatch):
     """
     Test that _get_client_params works correctly when no base_url is specified
     """
-    # Clear env vars that could set base_url
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_BASE", raising=False)
 
@@ -507,19 +635,16 @@ def test_openai_streaming_with_response_model():
     llm = LLM(model="openai/gpt-4o", stream=True)
 
     with patch.object(llm._client.beta.chat.completions, "stream") as mock_stream:
-        # Create mock chunks with content.delta event structure
         mock_chunk1 = MagicMock()
         mock_chunk1.type = "content.delta"
         mock_chunk1.delta = '{"answer": "test", '
         mock_chunk1.id = "response-1"
 
-        # Second chunk
         mock_chunk2 = MagicMock()
         mock_chunk2.type = "content.delta"
         mock_chunk2.delta = '"confidence": 0.95}'
         mock_chunk2.id = "response-2"
 
-        # Create mock final completion with parsed result
         mock_parsed = TestResponse(answer="test", confidence=0.95)
         mock_message = MagicMock()
         mock_message.parsed = mock_parsed
@@ -528,7 +653,6 @@ def test_openai_streaming_with_response_model():
         mock_final_completion = MagicMock()
         mock_final_completion.choices = [mock_choice]
 
-        # Create mock stream context manager
         mock_stream_obj = MagicMock()
         mock_stream_obj.__enter__ = MagicMock(return_value=mock_stream_obj)
         mock_stream_obj.__exit__ = MagicMock(return_value=None)
@@ -787,9 +911,7 @@ def test_openai_responses_api_call_routing():
         assert result == "responses result"
 
 
-# =============================================================================
 # VCR Integration Tests for Responses API
-# =============================================================================
 
 
 @pytest.mark.vcr()
@@ -1046,9 +1168,7 @@ def test_openai_responses_api_parse_tool_outputs_basic_call():
     assert not result.has_tool_outputs()
 
 
-# ============================================================================
 # Auto-Chaining Tests (Responses API)
-# ============================================================================
 
 
 def test_openai_responses_api_auto_chain_param():
@@ -1097,11 +1217,9 @@ def test_openai_responses_api_reset_chain():
         auto_chain=True,
     )
 
-    # Set a response ID
     llm._last_response_id = "resp_test_123"
     assert llm.last_response_id == "resp_test_123"
 
-    # Reset the chain
     llm.reset_chain()
     assert llm.last_response_id is None
 
@@ -1118,7 +1236,6 @@ def test_openai_responses_api_auto_chain_prepare_params():
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
     assert "previous_response_id" not in params
 
-    # Set a previous response ID
     llm._last_response_id = "resp_previous_123"
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
     assert params.get("previous_response_id") == "resp_previous_123"
@@ -1133,7 +1250,6 @@ def test_openai_responses_api_explicit_previous_response_id_takes_precedence():
         previous_response_id="resp_explicit_456",
     )
 
-    # Set an auto-chained response ID
     llm._last_response_id = "resp_auto_123"
 
     # Explicit should take precedence
@@ -1164,7 +1280,6 @@ def test_openai_responses_api_auto_chain_integration():
         auto_chain=True,
     )
 
-    # First call - should not have previous_response_id
     assert llm.last_response_id is None
     result1 = llm.call("My name is Alice. Remember this.")
 
@@ -1173,14 +1288,12 @@ def test_openai_responses_api_auto_chain_integration():
     first_response_id = llm.last_response_id
     assert first_response_id.startswith("resp_")
 
-    # Second call - should use the first response ID
     result2 = llm.call("What is my name?")
 
     # Response ID should be updated
     assert llm.last_response_id is not None
-    assert llm.last_response_id != first_response_id  # Should be a new ID
+    assert llm.last_response_id != first_response_id
 
-    # The response should remember context (Alice)
     assert isinstance(result1, str)
     assert isinstance(result2, str)
 
@@ -1194,26 +1307,20 @@ def test_openai_responses_api_auto_chain_with_reset():
         auto_chain=True,
     )
 
-    # First conversation
     llm.call("My favorite color is blue.")
     first_chain_id = llm.last_response_id
     assert first_chain_id is not None
 
-    # Reset and start new conversation
     llm.reset_chain()
     assert llm.last_response_id is None
 
-    # New call should start fresh
     llm.call("Hello!")
     second_chain_id = llm.last_response_id
     assert second_chain_id is not None
-    # New conversation, so different response ID
     assert second_chain_id != first_chain_id
 
 
-# =============================================================================
 # Encrypted Reasoning for ZDR (Zero Data Retention) Tests
-# =============================================================================
 
 
 def test_openai_responses_api_auto_chain_reasoning_param():
@@ -1268,7 +1375,6 @@ def test_openai_responses_api_reset_reasoning_chain():
     llm._last_reasoning_items = mock_items
     assert llm.last_reasoning_items == mock_items
 
-    # Reset the reasoning chain
     llm.reset_reasoning_chain()
     assert llm.last_reasoning_items is None
 
@@ -1312,7 +1418,6 @@ def test_openai_responses_api_auto_chain_reasoning_no_duplicate_include():
 
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
     assert "include" in params
-    # Should only appear once
     assert params["include"].count("reasoning.encrypted_content") == 1
 
 
@@ -1332,7 +1437,6 @@ def test_openai_responses_api_auto_chain_reasoning_prepends_to_input():
 
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
 
-    # Input should have reasoning item first, then the message
     assert len(params["input"]) == 2
     assert params["input"][0] == mock_reasoning
     assert params["input"][1]["role"] == "user"
@@ -1347,7 +1451,6 @@ def test_openai_responses_api_auto_chain_reasoning_disabled_no_include():
     )
 
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
-    # Should not have include at all (unless explicitly set)
     assert "include" not in params or "reasoning.encrypted_content" not in params.get("include", [])
 
 
@@ -1366,7 +1469,6 @@ def test_openai_responses_api_auto_chain_reasoning_disabled_no_prepend():
 
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
 
-    # Input should only have the message, not the reasoning item
     assert len(params["input"]) == 1
     assert params["input"][0]["role"] == "user"
 
@@ -1393,15 +1495,12 @@ def test_openai_responses_api_both_auto_chains_work_together():
 
     params = llm._prepare_responses_params(messages=[{"role": "user", "content": "test"}])
 
-    # Both should be applied
     assert params.get("previous_response_id") == "resp_123"
     assert "reasoning.encrypted_content" in params["include"]
     assert len(params["input"]) == 2  # Reasoning item + message
 
 
-# =============================================================================
 # Agent Kickoff Structured Output Tests
-# =============================================================================
 
 
 @pytest.mark.vcr()
@@ -1482,9 +1581,6 @@ def test_openai_agent_kickoff_structured_output_with_tools():
     assert result.pydantic.explanation, "Explanation should not be empty"
 
 
-# =============================================================================
-# Stop Words with Structured Output Tests
-# =============================================================================
 
 
 def test_openai_stop_words_not_applied_to_structured_output():
@@ -1504,21 +1600,17 @@ def test_openai_stop_words_not_applied_to_structured_output():
     # Create OpenAI completion instance with stop words configured
     llm = OpenAICompletion(
         model="gpt-4o",
-        stop=["Observation:", "Final Answer:"],  # Common stop words
+        stop=["Observation:", "Final Answer:"],
     )
 
     # JSON response that contains a stop word pattern in a string field
-    # Without the fix, this would be truncated at "Observation:" breaking the JSON
     json_response = '{"finding": "The data shows growth", "observation": "Observation: This confirms the hypothesis"}'
 
-    # Test the _validate_structured_output method directly with content containing stop words
     # This simulates what happens when the API returns JSON with stop word patterns
     result = llm._validate_structured_output(json_response, ResearchResult)
 
-    # Should successfully parse the full JSON without truncation
     assert isinstance(result, ResearchResult)
     assert result.finding == "The data shows growth"
-    # The observation field should contain the full text including "Observation:"
     assert "Observation:" in result.observation
 
 
@@ -1599,7 +1691,6 @@ def test_openai_stop_words_still_applied_to_regular_responses():
     # Response that contains a stop word - should be truncated
     response_with_stop_word = "I need to search for more information.\n\nAction: search\nObservation: Found results"
 
-    # Test the _apply_stop_words method directly
     result = llm._apply_stop_words(response_with_stop_word)
 
     # Response should be truncated at the stop word
@@ -1651,19 +1742,16 @@ def test_openai_completions_cached_prompt_tokens():
     cached_prompt_tokens from prompt_tokens_details.cached_tokens.
     Sends the same large prompt twice so the second call hits the cache.
     """
-    # Build a large system prompt to trigger prompt caching (>1024 tokens)
     padding = "This is padding text to ensure the prompt is large enough for caching. " * 80
     system_msg = f"You are a helpful assistant. {padding}"
 
     llm = OpenAICompletion(model="gpt-4.1")
 
-    # First call: creates the cache
     llm.call([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": "Say hello in one word."},
     ])
 
-    # Second call: same system prompt should hit the cache
     llm.call([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": "Say goodbye in one word."},
@@ -1674,7 +1762,6 @@ def test_openai_completions_cached_prompt_tokens():
     assert usage.prompt_tokens > 0
     assert usage.completion_tokens > 0
     assert usage.successful_requests == 2
-    # The second call should have cached prompt tokens
     assert usage.cached_prompt_tokens > 0
 
 
@@ -1689,13 +1776,11 @@ def test_openai_responses_api_cached_prompt_tokens():
 
     llm = OpenAICompletion(model="gpt-4.1", api="responses")
 
-    # First call: creates the cache
     llm.call([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": "Say hello in one word."},
     ])
 
-    # Second call: same system prompt should hit the cache
     llm.call([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": "Say goodbye in one word."},
@@ -1706,7 +1791,6 @@ def test_openai_responses_api_cached_prompt_tokens():
     assert usage.prompt_tokens > 0
     assert usage.completion_tokens > 0
     assert usage.successful_requests == 2
-    # The second call should have cached prompt tokens
     assert usage.cached_prompt_tokens > 0
 
 
@@ -1721,13 +1805,11 @@ def test_openai_streaming_cached_prompt_tokens():
 
     llm = OpenAICompletion(model="gpt-4.1", stream=True)
 
-    # First call: creates the cache
     llm.call([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": "Say hello in one word."},
     ])
 
-    # Second call: same system prompt should hit the cache
     llm.call([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": "Say goodbye in one word."},
@@ -1736,7 +1818,6 @@ def test_openai_streaming_cached_prompt_tokens():
     usage = llm.get_token_usage_summary()
     assert usage.total_tokens > 0
     assert usage.successful_requests == 2
-    # The second call should have cached prompt tokens
     assert usage.cached_prompt_tokens > 0
 
 
@@ -1772,7 +1853,6 @@ def test_openai_completions_cached_prompt_tokens_with_tools():
 
     llm = OpenAICompletion(model="gpt-4.1")
 
-    # First call with tool: creates the cache
     llm.call(
         [
             {"role": "system", "content": system_msg},
@@ -1782,7 +1862,6 @@ def test_openai_completions_cached_prompt_tokens_with_tools():
         available_functions={"get_weather": get_weather},
     )
 
-    # Second call with same system prompt + tools: should hit the cache
     llm.call(
         [
             {"role": "system", "content": system_msg},
@@ -1796,7 +1875,6 @@ def test_openai_completions_cached_prompt_tokens_with_tools():
     assert usage.total_tokens > 0
     assert usage.prompt_tokens > 0
     assert usage.successful_requests == 2
-    # The second call should have cached prompt tokens
     assert usage.cached_prompt_tokens > 0
 
 
@@ -1831,7 +1909,6 @@ def test_openai_responses_api_cached_prompt_tokens_with_tools():
 
     llm = OpenAICompletion(model="gpt-4.1", api='responses')
 
-    # First call with tool
     llm.call(
         [
             {"role": "system", "content": system_msg},
@@ -1841,7 +1918,6 @@ def test_openai_responses_api_cached_prompt_tokens_with_tools():
         available_functions={"get_weather": get_weather},
     )
 
-    # Second call: same system prompt + tools should hit cache
     llm.call(
         [
             {"role": "system", "content": system_msg},
