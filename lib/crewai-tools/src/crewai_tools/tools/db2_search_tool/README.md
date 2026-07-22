@@ -16,12 +16,6 @@ Supports:
 # Installation
 
 ```bash
-pip install ibm_db openai
-```
-
-Or with uv:
-
-```bash
 uv add ibm_db openai
 ```
 
