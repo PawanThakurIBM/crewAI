@@ -49,10 +49,9 @@ _ibm_db_dbi_stub = _make_ibm_db_dbi_stub()
 sys.modules.setdefault("ibm_db", _ibm_db_stub)
 sys.modules.setdefault("ibm_db_dbi", _ibm_db_dbi_stub)
 
+from crewai_tools import DB2ToolSchema, DB2VectorSearchTool  # noqa: E402
 from crewai_tools.tools.db2_search_tool.db2_search_tool import (  # noqa: E402
     DB2JSONEncoder,
-    DB2ToolSchema,
-    DB2VectorSearchTool,
 )
 
 
